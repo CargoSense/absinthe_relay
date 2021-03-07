@@ -419,6 +419,21 @@ defmodule Absinthe.Relay.Connection do
   or an explicit `count: ` option to the `from_query` call.
   Otherwise it is impossible to derive the required offset.
 
+  The default pagination system is LIMIT/OFFSET which simply uses the supplied
+  OFFSET into the query as the starting point. This can cause unexpected
+  behaviour when, for example, an item is added or deleted between two
+  pagination requests since the offset of the first/last item of the pages
+  can change.
+
+  An alternative pagination system is provided by specifying at least one field
+  in the `cursor_fields` opt. This causes the request to generate record-based
+  cursors for the `before` and `after` values using Paginator
+  (https://github.com/duffelhq/paginator). To use this mode, Paginator must
+  be included as a dependency.
+
+  Note that when using cursor pagination mode, the repo function should be
+  replaced by the repo module (since Paginator itself supplies the function).
+
   ## Example
   ```
   # In a PostResolver module
@@ -429,13 +444,20 @@ defmodule Absinthe.Relay.Connection do
     |> where(author_id: ^user.id)
     |> Relay.Connection.from_query(&Repo.all/1, args)
   end
+
+  # With Cursor pagination
+  def get_page(args, %{context: %{current_user: user}}) do
+    Post
+    |> where(author_id: ^user.id)
+    |> Relay.Connection.from_query(Repo, args, cursor_fields: [:id])
   ```
   """
 
   @type from_query_opts ::
           [
             count: non_neg_integer,
-            max: pos_integer
+            max: pos_integer,
+            cursor_fields: [atom]
           ]
           | from_slice_opts
 
@@ -444,26 +466,14 @@ defmodule Absinthe.Relay.Connection do
             {:ok, map} | {:error, any}
     @spec from_query(
             Ecto.Queryable.t(),
-            (Ecto.Queryable.t() -> [term]),
+            (Ecto.Queryable.t() -> [term]) | module(),
             Options.t(),
             from_query_opts
           ) :: {:ok, map} | {:error, any}
     def from_query(query, repo_fun, args, opts \\ []) do
-      require Ecto.Query
-
-      with {:ok, offset, limit} <- offset_and_limit_for_query(args, opts) do
-        records =
-          query
-          |> Ecto.Query.limit(^(limit + 1))
-          |> Ecto.Query.offset(^offset)
-          |> repo_fun.()
-
-        opts =
-          opts
-          |> Keyword.put(:has_previous_page, offset > 0)
-          |> Keyword.put(:has_next_page, length(records) > limit)
-
-        from_slice(Enum.take(records, limit), offset, opts)
+      case opts[:cursor_fields] do
+        nil -> offset_limit_pagination_from_query(query, repo_fun, args, opts)
+        _ -> cursor_pagination_from_query(query, repo_fun, args, opts)
       end
     end
   else
@@ -473,6 +483,24 @@ defmodule Absinthe.Relay.Connection do
 
       You cannot use this unless Ecto is also a dependency
       """
+    end
+  end
+
+  defp offset_limit_pagination_from_query(query, repo_fun, args, opts) do
+    require Ecto.Query
+    with {:ok, offset, limit} <- offset_and_limit_for_query(args, opts) do
+      records =
+        query
+        |> Ecto.Query.limit(^limit)
+        |> Ecto.Query.offset(^offset)
+        |> repo_fun.()
+
+      opts =
+        opts
+        |> Keyword.put(:has_previous_page, offset > 0)
+        |> Keyword.put(:has_next_page, length(records) > limit)
+
+      from_slice(Enum.take(records, limit), offset, opts)
     end
   end
 
@@ -621,5 +649,145 @@ defmodule Absinthe.Relay.Connection do
     else
       _ -> {:error, "Invalid cursor"}
     end
+  end
+
+  if Code.ensure_loaded(Paginator) do
+    import Ecto.Query
+
+    defp cursor_pagination_from_query(query, repo_module, args, opts) do
+      with {:ok, cursor_fields} <- cursor_fields(opts),
+           {:ok, _direction, limit} <- __MODULE__.limit(args, opts[:max]),
+           {:ok, cursor} <- cursor(args) do
+
+        {entries, page_info} = paginate(query, repo_module, args, cursor, cursor_fields, limit)
+
+        edges =
+          entries
+          |> Enum.map(&make_edge(&1, args, cursor_fields))
+
+        {:ok, %{edges: edges, page_info: page_info}}
+      end
+    end
+
+    defp paginate(query, repo_module, %{first: _}, [after: _] = cursor, cursor_fields, limit) do
+      query
+      |> repo_module.paginate(paginate_opts(cursor, cursor_fields, limit + 1))
+      |> page_to_result(:forwards, limit)
+    end
+
+    defp paginate(query, repo_module, %{last: _}, [before: _] = cursor, cursor_fields, limit) do
+      query
+      |> repo_module.paginate(paginate_opts(cursor, cursor_fields, limit + 1))
+      |> page_to_result(:backwards, limit)
+    end
+
+    defp paginate(query, repo_module, %{first: f}, cursor, cursor_fields, _limit) do
+      {records, more_pages} = records_until_cursor(query, repo_module, f, cursor_fields, cursor)
+
+      first = List.first(records)
+
+      {
+        records,
+        %{start_cursor: nil,
+          end_cursor: (first && Paginator.cursor_for_record(first, cursor_fields)) || nil,
+          has_previous_page: false,
+          has_next_page: more_pages
+        }
+      }
+    end
+
+    defp paginate(query, repo_module, %{last: l}, cursor, cursor_fields, _limit) do
+      {records, more_pages} =
+        query
+        |> last()
+        |> exclude(:limit)
+        |> records_until_cursor(repo_module, l, cursor_fields, cursor)
+
+      last = List.first(records)
+
+      {
+        Enum.reverse(records),
+        %{start_cursor: nil,
+          end_cursor: (last && Paginator.cursor_for_record(last, cursor_fields)) || nil,
+          has_previous_page: more_pages,
+          has_next_page: false
+        }
+      }
+    end
+
+    defp records_until_cursor(query, repo_module, count, cursor_fields, cursor) do
+      cursor_record = cursor[:before] || cursor[:after]
+
+      full_records =
+        query
+        |> Ecto.Query.limit(^(count + 1))
+        |> repo_module.all()
+
+      selected_records =
+        full_records
+        |> Enum.take(count)
+        |> Enum.take_while(&(Paginator.cursor_for_record(&1, cursor_fields) != cursor_record))
+
+      {selected_records, length(selected_records) != length(full_records)}
+    end
+
+    defp page_to_result(page, direction, limit) do
+      count = length(page.entries)
+
+      {
+        take(page.entries, limit, direction),
+        %{
+          start_cursor: page.metadata.before,
+          end_cursor: page.metadata.after,
+          has_previous_page: has_previous_page(count, limit, direction),
+          has_next_page: has_next_page(count, limit, direction)
+        }
+      }
+    end
+
+  else
+    def cursor_pagination_from_query(_, _, _, _) do
+      raise ArgumentError, """
+      Paginator not Loaded!
+
+      You cannot use cursor pagination unless Paginator is also a dependency
+      """
+    end
+  end
+
+  defp paginate_opts(cursor, cursor_fields, limit),
+  do: cursor ++ [cursor_fields: cursor_fields, limit: limit]
+
+  defp cursor_fields(opts) do
+    case opts[:cursor_fields] do
+      [] -> {:error, "cursor pagination requires at least one cursor field"}
+      fields -> {:ok, fields}
+    end
+  end
+
+  defp cursor(%{after: cursor}) when not is_nil(cursor),
+    do: {:ok, after: cursor}
+
+  defp cursor(%{before: cursor}) when not is_nil(cursor),
+    do: {:ok, before: cursor}
+
+  defp cursor(_), do: {:ok, []}
+
+  defp make_edge(record, args, cursor_fields) do
+    cursor = Paginator.cursor_for_record(record, cursor_fields)
+    build_edge({record, args}, cursor)
+  end
+
+  defp has_next_page(r, limit, :forwards), do: r > limit
+  defp has_next_page(_r, _limit, :backwards), do: false
+
+  defp has_previous_page(r, limit, :backwards), do: r > limit
+  defp has_previous_page(_r, _limit, :forwards), do: false
+
+  defp take(records, count, :forwards), do: Enum.take(records, count)
+  defp take(records, count, :backwards) do
+    records
+    |> Enum.split(-count)
+    |> elem(1)
   end
 end
