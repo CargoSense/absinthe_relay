@@ -23,7 +23,7 @@ defmodule Absinthe.Relay.Node.IDTranslator.Base64 do
         end
 
       :error ->
-        {:error, "Could not decode ID value `#{global_id}'"}
+        {:error, "Could not decode ID value `#{global_id}`"}
     end
   end
 end

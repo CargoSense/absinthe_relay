@@ -221,13 +221,13 @@ defmodule Absinthe.Relay.Node do
   defp do_from_global_id({type_name, id}, schema) do
     case schema.__absinthe_type__(type_name) do
       nil ->
-        {:error, "Unknown type `#{type_name}'"}
+        {:error, "Unknown type `#{type_name}`"}
 
       %{identifier: ident, interfaces: interfaces} ->
         if Enum.member?(List.wrap(interfaces), :node) do
           {:ok, %{type: ident, id: id}}
         else
-          {:error, "Type `#{type_name}' is not a valid node type"}
+          {:error, "Type `#{type_name}` is not a valid node type"}
         end
     end
   end
