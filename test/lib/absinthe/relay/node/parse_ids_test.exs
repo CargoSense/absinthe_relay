@@ -181,6 +181,11 @@ defmodule Absinthe.Relay.Node.ParseIDsTest do
       {:ok, values}
     end
 
+    defp resolve_child_by_id(%{children: children}, %{id: id}, _) do
+      child = Enum.find(children, &(&1.id === id))
+      {:ok, child}
+    end
+
     defp resolve_parent(args, _) do
       {:ok, args |> to_parent_output}
     end
@@ -518,6 +523,40 @@ defmodule Absinthe.Relay.Node.ParseIDsTest do
           "id" => @parent1_id,
           "children" => [%{"id" => @child1_id}, nil],
           "child" => nil
+        }
+      }
+
+      assert {:ok, %{data: %{"updateParent" => expected_parent_data}}} == result
+    end
+
+    test "works with nested id args" do
+      result =
+        """
+        mutation Foobar {
+          updateParent(input: {
+            clientMutationId: "abc",
+            parent: {
+              id: "#{@parent1_id}",
+              children: [{ id: "#{@child1_id}"}, {id: "#{@child2_id}"}],
+              child: { id: "#{@child2_id}"}
+            }
+          }) {
+            parent {
+              id
+              childById(id: "#{@child2_id}") { id }
+            }
+          }
+        }
+        """
+        |> Absinthe.run(SchemaClassic)
+
+      expected_parent_data = %{
+        "parent" => %{
+          # The output re-converts everything to global_ids.
+          "id" => @parent1_id,
+          "childById" => %{
+            "id" => @child2_id
+          }
         }
       }
 
