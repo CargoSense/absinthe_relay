@@ -14,7 +14,7 @@ defmodule Absinthe.Relay.Connection.Notation do
 
   alias Absinthe.Blueprint.Schema
 
-  @naming_attrs [:node_type, :non_null, :non_null_edges, :non_null_edge, :connection]
+  @naming_attrs [:node_type, :non_null, :non_null_edges, :non_null_edge, :non_null_connection, :connection]
 
   defmodule Naming do
     @moduledoc false
@@ -25,6 +25,7 @@ defmodule Absinthe.Relay.Connection.Notation do
               edge_type_identifier: nil,
               non_null_edges: false,
               non_null_edge: false,
+              non_null_connection: false,
               attrs: []
 
     def from_attrs!(attrs) do
@@ -37,6 +38,7 @@ defmodule Absinthe.Relay.Connection.Notation do
       base_identifier = attrs[:connection] || node_type_identifier
       non_null_edges = attrs[:non_null_edges] || attrs[:non_null] || false
       non_null_edge = attrs[:non_null_edge] || attrs[:non_null] || false
+      non_null_connection = attrs[:non_null_connection] || attrs[:non_null] || false
 
       %__MODULE__{
         node_type_identifier: node_type_identifier,
@@ -45,11 +47,13 @@ defmodule Absinthe.Relay.Connection.Notation do
         edge_type_identifier: ident(base_identifier, :edge),
         non_null_edges: non_null_edges,
         non_null_edge: non_null_edge,
+        non_null_connection: non_null_connection,
         attrs: [
           node_type: node_type_identifier,
           connection: base_identifier,
           non_null_edges: non_null_edges,
-          non_null_edge: non_null_edge
+          non_null_edge: non_null_edge,
+          non_null_connection: non_null_connection
         ]
       }
     end
@@ -137,7 +141,7 @@ defmodule Absinthe.Relay.Connection.Notation do
     field_attrs =
       attrs
       |> Keyword.drop([:paginate] ++ @naming_attrs)
-      |> Keyword.put(:type, naming.connection_type_identifier)
+      |> Keyword.put(:type, build_connection_type(naming))
 
     quote do
       field unquote(identifier), unquote(field_attrs) do
@@ -168,6 +172,16 @@ defmodule Absinthe.Relay.Connection.Notation do
         unquote(block)
       end
     end
+  end
+
+  defp build_connection_type(%{non_null_connection: true} = naming) do
+    quote do
+      non_null(unquote(naming.connection_type_identifier))
+    end
+  end
+
+  defp build_connection_type(%{non_null_connection: false} = naming) do
+    naming.connection_type_identifier
   end
 
   defp build_edge_type(%{non_null_edge: true, non_null_edges: true} = naming) do
